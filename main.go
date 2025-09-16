@@ -10,17 +10,27 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Thijs-Desjardijn/chirpy/internal/database"
 
-	_ "github.com/google/uuid"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
 type chirp struct {
-	Body   string `json:"body"`
-	UserId string `json:"user_id"`
+	Id     uuid.UUID `json:"id"`
+	Body   string    `json:"body"`
+	UserId uuid.UUID `json:"user_id"`
+}
+
+type ChirpRes struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 type apiConfig struct {
@@ -30,6 +40,13 @@ type apiConfig struct {
 
 type user struct {
 	Email string `json:"email"`
+}
+
+func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
+	cfg.dbQueries.RemoveUsers(context.Background())
+	cfg.dbQueries.RemoveChirps(context.Background())
+	cfg.fileserverHits.Swap(0)
+	w.WriteHeader(200)
 }
 
 func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, r *http.Request) {
@@ -54,20 +71,22 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
+func errHandler(w http.ResponseWriter, message string, errorCode int) {
+	w.WriteHeader(errorCode)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, message)))
+}
+
 func (cfg *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 	var chirpReq chirp
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&chirpReq)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"error":"Something went wrong"}`))
+		errHandler(w, fmt.Sprintf("decoding failed %v", err), 400)
 		return
 	}
 	if len(chirpReq.Body) > 140 {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"error":"Chirp is too long"}`))
+		errHandler(w, "Chirp is too long", 404)
 		return
 	}
 	badWords := []string{"kerfuffle", "sharbert", "fornax"}
@@ -80,9 +99,82 @@ func (cfg *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	chirpReq.Body = strings.Join(splitChirp, " ")
+	args := database.CreateChirpParams{
+		Body:   chirpReq.Body,
+		UserID: chirpReq.UserId,
+	}
+	chirp, err := cfg.dbQueries.CreateChirp(context.Background(), args)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("failed to save chirp in database: %v", err), 500)
+		return
+	}
+	w.WriteHeader(201)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(fmt.Sprintf(`{"cleaned_body":"%s"}`, chirpReq.Body)))
+	w.Write([]byte(fmt.Sprintf(`{
+  "id": "%v",
+  "created_at": "%v",
+  "updated_at": "%v",
+  "body": "%s",
+  "user_id": "%v"
+}`, chirp.ID, chirp.CreatedAt, chirp.UpdatedAt, chirp.Body, chirp.UserID)))
+}
+
+func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
+	var chirpBody chirp
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&chirpBody)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("decoding failed %v", err), 404)
+		return
+	}
+	chirp, err := cfg.dbQueries.GetChirp(context.Background(), chirpBody.Id)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("getting chirp failed %v", err), 404)
+		return
+	}
+	formattedChirp := ChirpRes{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+	data, err := json.Marshal(formattedChirp)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("marshal failed %v", err), 404)
+		return
+	}
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(data)
+
+}
+
+func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
+	allChirps, err := cfg.dbQueries.GetAllChirps(r.Context())
+	if err != nil {
+		errHandler(w, fmt.Sprintf("getting all chirps failed %v", err), 500)
+		return
+	}
+	var formattedAllchirps []ChirpRes
+	for _, chirp := range allChirps {
+		formattedChirp := ChirpRes{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+		}
+		formattedAllchirps = append(formattedAllchirps, formattedChirp)
+	}
+	jsonAllChirps, err := json.Marshal(formattedAllchirps)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("marshal failed %v", err), 400)
+		return
+	}
+	w.Header().Add("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(jsonAllChirps)
 }
 
 func (cfg *apiConfig) handlerReadiness(w http.ResponseWriter, r *http.Request) {
@@ -91,27 +183,17 @@ func (cfg *apiConfig) handlerReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
-	cfg.dbQueries.RemoveUsers(context.Background())
-	cfg.fileserverHits.Swap(0)
-	w.WriteHeader(200)
-}
-
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
 	var userR user
 	decoder := json.NewDecoder(r.Body)
 	err := decoder.Decode(&userR)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(404)
-		w.Write([]byte(fmt.Sprintf(`{"failed":"decode jsondata: %v"}`, err)))
+		errHandler(w, fmt.Sprintf("decoding failed %v", err), 400)
 		return
 	}
 	user, err := cfg.dbQueries.CreateUser(r.Context(), userR.Email)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(404)
-		w.Write([]byte(fmt.Sprintf(`{"failed":"creating user in database failed: %v"}`, err)))
+		errHandler(w, fmt.Sprintf("creating user in database failed: %v", err), 500)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -151,5 +233,7 @@ func main() {
 	serveMux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
 	serveMux.HandleFunc("POST /api/chirps", apiCfg.handlerChirp)
 	serveMux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
+	serveMux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
+	serveMux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
 	select {}
 }
