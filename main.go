@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Thijs-Desjardijn/chirpy/internal/auth"
 	"github.com/Thijs-Desjardijn/chirpy/internal/database"
 
 	"github.com/google/uuid"
@@ -36,10 +37,21 @@ type ChirpRes struct {
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
+	secret         string
 }
 
 type user struct {
-	Email string `json:"email"`
+	PassWord  string        `json:"password"`
+	Email     string        `json:"email"`
+	ExpiresAt time.Duration `json:"expires_in_seconds"`
+}
+
+type userData struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
@@ -78,9 +90,20 @@ func errHandler(w http.ResponseWriter, message string, errorCode int) {
 }
 
 func (cfg *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
+	authorizationCheck, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		errHandler(w, "Unauthorized", 401)
+		fmt.Println(err)
+		return
+	}
+	userJWT, err := auth.ValidateJWT(authorizationCheck, cfg.secret)
+	if err != nil {
+		errHandler(w, "Unauthorized 1", 401)
+		return
+	}
 	var chirpReq chirp
 	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&chirpReq)
+	err = decoder.Decode(&chirpReq)
 	if err != nil {
 		errHandler(w, fmt.Sprintf("decoding failed %v", err), 400)
 		return
@@ -101,7 +124,7 @@ func (cfg *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 	chirpReq.Body = strings.Join(splitChirp, " ")
 	args := database.CreateChirpParams{
 		Body:   chirpReq.Body,
-		UserID: chirpReq.UserId,
+		UserID: userJWT,
 	}
 	chirp, err := cfg.dbQueries.CreateChirp(context.Background(), args)
 	if err != nil {
@@ -120,14 +143,12 @@ func (cfg *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
-	var chirpBody chirp
-	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&chirpBody)
+	idString := r.PathValue("chirpID")
+	id, err := uuid.Parse(idString)
 	if err != nil {
-		errHandler(w, fmt.Sprintf("decoding failed %v", err), 404)
-		return
+		errHandler(w, fmt.Sprintf("parsing failed %v", err), 404)
 	}
-	chirp, err := cfg.dbQueries.GetChirp(context.Background(), chirpBody.Id)
+	chirp, err := cfg.dbQueries.GetChirp(context.Background(), id)
 	if err != nil {
 		errHandler(w, fmt.Sprintf("getting chirp failed %v", err), 404)
 		return
@@ -147,7 +168,6 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(200)
 	w.Write(data)
-
 }
 
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
@@ -183,6 +203,51 @@ func (cfg *apiConfig) handlerReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	var userR user
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&userR)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("decoding failed %v", err), 400)
+		return
+	}
+	if userR.ExpiresAt < 1*time.Second {
+		userR.ExpiresAt = 3600 * time.Second
+	} else if userR.ExpiresAt > 3600*time.Second {
+		userR.ExpiresAt = 3600 * time.Second
+	}
+
+	userD, err := cfg.dbQueries.FindUserEmail(context.Background(), userR.Email)
+	if err != nil {
+		errHandler(w, "Incorrect email or password", 401)
+		return
+	}
+	err = auth.CheckPasswordHash(userR.PassWord, userD.HashedPassword)
+	if err != nil {
+		errHandler(w, "Incorrect email or password", 401)
+		return
+	}
+	token, err := auth.MakeJWT(userD.ID, cfg.secret, userR.ExpiresAt)
+	if err != nil {
+		errHandler(w, "making token failed", 500)
+	}
+	validatedUser := userData{
+		ID:        userD.ID,
+		CreatedAt: userD.CreatedAt,
+		UpdatedAt: userD.UpdatedAt,
+		Email:     userD.Email,
+		Token:     token,
+	}
+	data, err := json.Marshal(validatedUser)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("marshal failed %v", err), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write(data)
+}
+
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
 	var userR user
 	decoder := json.NewDecoder(r.Body)
@@ -191,7 +256,20 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		errHandler(w, fmt.Sprintf("decoding failed %v", err), 400)
 		return
 	}
-	user, err := cfg.dbQueries.CreateUser(r.Context(), userR.Email)
+	if len(userR.PassWord) < 1 {
+		errHandler(w, "password is required", 400)
+		return
+	}
+	userR.PassWord, err = auth.HashPassword(userR.PassWord)
+	if err != nil {
+		errHandler(w, fmt.Sprintf("failed to hash password %v", err), 500)
+		return
+	}
+	args := database.CreateUserParams{
+		Email:          userR.Email,
+		HashedPassword: userR.PassWord,
+	}
+	user, err := cfg.dbQueries.CreateUser(r.Context(), args)
 	if err != nil {
 		errHandler(w, fmt.Sprintf("creating user in database failed: %v", err), 500)
 		return
@@ -212,12 +290,13 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 	dbURL := os.Getenv("DB_URL")
+	secret := os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	dbQueries := database.New(db)
-	apiCfg := apiConfig{dbQueries: dbQueries}
+	apiCfg := apiConfig{dbQueries: dbQueries, secret: secret}
 	serveMux := http.NewServeMux()
 	server := http.Server{
 		Addr:                         ":8080",
@@ -235,5 +314,6 @@ func main() {
 	serveMux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	serveMux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
 	serveMux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
+	serveMux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	select {}
 }
